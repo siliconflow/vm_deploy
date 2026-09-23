@@ -1,0 +1,40 @@
+# ===== 磁盘镜像 / 安装介质（体积大，不入库）=====
+*.qcow2
+*.qcow2.*
+*.img
+*.raw
+*.vmdk
+*.vdi
+*.iso
+*.iso.*
+*.part
+*.tmp
+
+# 项目内默认镜像目录只保留目录结构，不提交大文件
+gen_qcow2/input_iso/*
+!gen_qcow2/input_iso/.gitkeep
+gen_qcow2/output_qcow2/*
+!gen_qcow2/output_qcow2/.gitkeep
+
+# ===== cloud-init / 部署生成物（由脚本自动生成）=====
+# WORK_DIR 若配置在仓库内时会产生的文件
+user-data
+meta-data
+network-config
+seed.iso
+seeds/
+
+# ===== 虚拟机运行临时文件 =====
+*.bak
+*.xml.tmp
+*.log
+
+# ===== 本地配置 / 敏感信息 =====
+*.env.local
+.env
+
+# ===== 编辑器 / 系统垃圾 =====
+.DS_Store
+*.swp
+.idea/
+.vscode/
