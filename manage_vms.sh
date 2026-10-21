@@ -1,21 +1,27 @@
 #!/usr/bin/env bash
 # ============================================================================
-# manage_vms.sh — 虚拟机批量启动/停止（自动适配 Linux / macOS 平台）
+# manage_vms.sh — 虚拟机批量启动/停止/状态查看/重启（自动适配 Linux / macOS 平台）
 #
 # 功能说明:
 #   Linux (KVM/libvirt): start=启动宿主机上全部 libvirt VM（virsh start）；
-#                        stop=对全部 libvirt VM 优雅关机（virsh shutdown），已停止的自动跳过
+#                        stop=对全部 libvirt VM 优雅关机（virsh shutdown），已停止的自动跳过；
+#                        status=查看全部 libvirt VM 的运行状态（只读，不修改任何状态）；
+#                        restart=先批量优雅停止再批量启动
 #   macOS (Lima):        start=逐台启动 deploy_vms.env 中 MACHINE_NAMES 定义的 Lima VM
 #                        （只操作本项目定义的 VM，不影响 colima 等其他实例），
 #                        并等待各 VM 的 SSH 端口就绪；
-#                        stop=逐台优雅关机（ACPI shutdown），已停止的自动跳过
+#                        stop=逐台优雅关机（ACPI shutdown），已停止的自动跳过；
+#                        status=查看各 VM 运行状态与 SSH 端口就绪情况（只读）；
+#                        restart=先批量优雅停止再批量启动（等价 stop + start）
 #
 # 使用说明:
-#   ./manage_vms.sh <start|stop> [选项]
+#   ./manage_vms.sh <start|stop|status|restart> [选项]
 #
 # 参数说明:
 #   start           批量启动 VM（已运行的自动跳过）
 #   stop            批量停止 VM（已停止的自动跳过）
+#   status          查看 VM 运行状态（只读，仅输出状态信息，不产生阶段日志）
+#   restart         批量重启 VM（等价于先 stop 再 start）
 #   -h, --help      显示本帮助
 #   --dry-run       预览将执行的操作，不实际执行
 #   -f, --force     仅 stop 有效: 强制断电（macOS/Lima 等价 limactl stop --force；
@@ -30,7 +36,7 @@
 #   Linux 分支不读取）
 #
 # 日志目录说明:
-#   ./logs/manage_vms_<start|stop>_YYYYmmdd_HHMMSS.log
+#   ./logs/manage_vms_<start|stop|status|restart>_YYYYmmdd_HHMMSS.log
 #
 # 产物目录说明:
 #   无（本脚本不产生持久化产物）
@@ -41,6 +47,9 @@
 #   ./manage_vms.sh stop
 #   ./manage_vms.sh stop --dry-run
 #   ./manage_vms.sh stop --force
+#   ./manage_vms.sh status
+#   ./manage_vms.sh restart
+#   ./manage_vms.sh restart --dry-run
 #
 # 风险提示:
 #   stop --force 为强制断电，可能导致 VM 内文件系统损坏，仅作兜底手段。
@@ -54,7 +63,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="$SCRIPT_DIR/logs"
 ENV_FILE="$SCRIPT_DIR/manage_vms.env"
 
-ACTION=""      # start | stop
+ACTION=""      # start | stop | status | restart
 DRY_RUN=0
 FORCE=0
 STAGE_NO=0
@@ -85,11 +94,11 @@ stage_end()   { log "---------- 阶段 $1/$STAGE_TOTAL 完成 ----------"; }
 usage() { awk 'NR>1 && /^#/{sub(/^# ?/,""); print; next} NR>1{exit}' "$0"; }
 
 parse_args() {
-  [[ $# -ge 1 ]] || { err "缺少子命令（start / stop）"; usage; exit 1; }
+  [[ $# -ge 1 ]] || { err "缺少子命令（start / stop / status / restart）"; usage; exit 1; }
   case "$1" in
-    start|stop) ACTION="$1" ;;
+    start|stop|status|restart) ACTION="$1" ;;
     -h|--help)  usage; exit 0 ;;
-    *) err "未知子命令: $1（支持 start / stop）"; usage; exit 1 ;;
+    *) err "未知子命令: $1（支持 start / stop / status / restart）"; usage; exit 1 ;;
   esac
   shift
   for arg in "$@"; do
@@ -100,7 +109,7 @@ parse_args() {
       *) err "未知参数: $arg"; usage; exit 1 ;;
     esac
   done
-  if [[ "$ACTION" == "start" && "$FORCE" -eq 1 ]]; then
+  if [[ "$ACTION" != "stop" && "$FORCE" -eq 1 ]]; then
     die "--force 仅在 stop 时有效"
   fi
 }
@@ -250,6 +259,56 @@ stop_lima() {
 }
 
 # ============================================================
+# macOS (Lima): 查看各 VM 运行状态与 SSH 就绪情况（只读）
+# ============================================================
+status_msg() { # $1=内容（status 专用：控制台只输出状态信息，同时记录日志文件）
+  echo "$1"
+  [[ -n "$LOG_FILE" ]] && echo "[status] $1" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+status_lima() {
+  load_lima_config
+  : "${MACHINE_SSH_PORTS:?MACHINE_SSH_PORTS 未配置}"
+  if [[ "${#MACHINE_NAMES[@]}" -ne "${#MACHINE_SSH_PORTS[@]}" ]]; then
+    die "配置错误: MACHINE_NAMES 与 MACHINE_SSH_PORTS 长度不一致，请检查 $ENV_FILE"
+  fi
+  command -v limactl >/dev/null 2>&1 || die "缺少 limactl，请先执行: brew install lima"
+
+  running=0; stopped=0; missing=0
+  i=0
+  for name in "${MACHINE_NAMES[@]}"; do
+    port="${MACHINE_SSH_PORTS[$i]}"
+    state="$(vm_state "$name")"
+    if [[ -z "$state" ]]; then
+      status_msg "$name: 未部署（未在 limactl 中注册），如需部署请执行 ./deploy_vms.sh deploy"
+      missing=$((missing+1)); i=$((i+1)); continue
+    fi
+    if [[ "$state" == "Running" ]]; then
+      if port_ready "$port"; then
+        status_msg "$name: Running，SSH 已就绪 (127.0.0.1:$port，ssh $name)"
+      else
+        status_msg "$name: Running，SSH 未就绪 (127.0.0.1:$port 不通)"
+      fi
+      running=$((running+1))
+    else
+      status_msg "$name: ${state}（已停止）"
+      stopped=$((stopped+1))
+    fi
+    i=$((i+1))
+  done
+  status_msg "状态统计: 运行中 ${running} 台，已停止 ${stopped} 台，未部署 ${missing} 台"
+}
+
+# ============================================================
+# macOS (Lima): 批量重启 VM（等价于 stop + start）
+# ============================================================
+restart_lima() {
+  log "restart = stop + start，先优雅停止全部 VM，再批量启动并等待 SSH 就绪"
+  stop_lima
+  start_lima
+}
+
+# ============================================================
 # Linux (KVM/libvirt): 批量启动全部 VM
 # ============================================================
 start_kvm() {
@@ -349,6 +408,40 @@ stop_kvm() {
   stage_end 3
 }
 
+# ============================================================
+# Linux (KVM/libvirt): 查看全部 VM 运行状态（只读）
+# ============================================================
+status_kvm() {
+  command -v virsh >/dev/null 2>&1 || die "缺少 virsh，请先安装 libvirt-clients"
+
+  mapfile -t vms < <(virsh --connect qemu:///system list --all --name | awk 'NF { print }')
+  if [[ ${#vms[@]} -eq 0 ]]; then
+    status_msg "未发现任何 libvirt VM"
+    return 0
+  fi
+  running=0; stopped=0
+  for vm in "${vms[@]}"; do
+    state="$(virsh --connect qemu:///system domstate "$vm" 2>/dev/null || true)"
+    if [[ "$state" == "running" || "$state" == "运行" ]]; then
+      status_msg "$vm: running（运行中）"
+      running=$((running+1))
+    else
+      status_msg "$vm: ${state:-unknown}（已停止）"
+      stopped=$((stopped+1))
+    fi
+  done
+  status_msg "状态统计: 运行中 ${running} 台，已停止 ${stopped} 台"
+}
+
+# ============================================================
+# Linux (KVM/libvirt): 批量重启全部 VM（等价于 stop + start）
+# ============================================================
+restart_kvm() {
+  log "restart = stop + start，先优雅停止全部 VM，再批量启动"
+  stop_kvm
+  start_kvm
+}
+
 # ----------------------------------------------------------------------------
 # 主入口：参数解析 → 日志初始化 → 子命令 + 平台分发
 # ----------------------------------------------------------------------------
@@ -358,7 +451,17 @@ mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/manage_vms_${ACTION}_$(date '+%Y%m%d_%H%M%S').log"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
-  if [[ "$ACTION" == "start" ]]; then start_lima; else stop_lima; fi
+  case "$ACTION" in
+    start)   start_lima ;;
+    stop)    stop_lima ;;
+    status)  status_lima ;;
+    restart) restart_lima ;;
+  esac
 else
-  if [[ "$ACTION" == "start" ]]; then start_kvm; else stop_kvm; fi
+  case "$ACTION" in
+    start)   start_kvm ;;
+    stop)    stop_kvm ;;
+    status)  status_kvm ;;
+    restart) restart_kvm ;;
+  esac
 fi

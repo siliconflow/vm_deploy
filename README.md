@@ -3,7 +3,7 @@
 基于 cloud-init 在本机批量部署麒麟 V10（或 Ubuntu 22.04）虚拟机，自动完成静态 IP、SSH 免密、hosts 解析、根分区扩容等初始化配置。
 
 - **Linux**：KVM/libvirt + 静态 IP（DHCP host 按 MAC 绑定），入口 [deploy_vms.sh](deploy_vms.sh)
-- **macOS (Apple Silicon)**：Lima + 固定 SSH 端口转发，后端实现 [deploy_vms_mac.sh](deploy_vms_mac.sh)
+- **macOS (Apple Silicon)**：Lima + 固定 SSH 端口转发（Lima 实现已集成进 [deploy_vms.sh](deploy_vms.sh)，按平台自动分发）
 - **平台自动分发**：`deploy_vms.sh` / `manage_vms.sh` 均自动检测平台——macOS 上自动转交 Lima 实现，用法与 Linux 完全一致，无需手动区分
 
 ## 功能特性
@@ -14,7 +14,7 @@
 - cloud-init 自动初始化：主机名、时区、用户、SSH 公钥、静态 IP
 - libvirt default 网络静态 IP 绑定（DHCP host 按 MAC 固定分配）
 - 自动配置宿主机与 VM 的 SSH 免密（RSA 密钥），所有本地普通用户均可通过 `machine1` 等别名直连
-- 自动写入 `/etc/hosts`，生成机器/IP 对照清单（上级目录 `machine_and_ip_list.txt`）
+- 自动写入 `/etc/hosts`；Linux 生成机器/IP/MAC 对照清单（上级目录 `machine_and_ip_list.txt`），macOS 生成 `vm_deploy/虚拟机配置信息.md`
 - VM 首次启动自动扩展根分区（`/`）到磁盘全量
 - 支持 `destroy` 一键销毁全部 VM（带确认提示）
 
@@ -23,9 +23,8 @@
 ```
 vm_deploy/
 ├── deploy_vms.env                        # 部署配置（Linux 段 + macOS 段，按平台各自读取）
-├── deploy_vms.sh                         # 主入口：Linux 走 KVM/libvirt，macOS 自动分发到 Lima 后端
-├── deploy_vms_mac.sh                     # macOS (Lima) 后端实现（deploy_vms.sh 在 Darwin 上自动调用）
-├── manage_vms.sh                        # 批量启动/停止虚拟机（manage_vms.sh start|stop，自动适配平台，stop 支持 --force）
+├── deploy_vms.sh                         # 主入口：Linux 走 KVM/libvirt，macOS 内置 Lima 实现（自动按平台分发）
+├── manage_vms.sh                        # 批量启动/停止/状态查看/重启虚拟机（manage_vms.sh start|stop|status|restart，自动适配平台，stop 支持 --force）
 ├── backup_vms.sh                        # VM 备份脚本
 ├── auto_sync.py                         # 仓库 Git 自动同步脚本
 ├── docker_service.sh / docker_service.env  # macOS: colima + Docker 服务管理
@@ -119,16 +118,18 @@ cd /data/vm_deploy          # macOS 上为项目所在目录
 # 销毁全部 VM（有危险提示，需输入 yes 确认；macOS 支持 --dry-run 预览 / --clean 清洁执行 / --yes 免确认）
 ./deploy_vms.sh destroy
 
-# 启动/停止所有 VM
+# 启动/停止/状态/重启所有 VM
 ./manage_vms.sh start
 ./manage_vms.sh stop          # --force 强制断电、--dry-run 预览
+./manage_vms.sh status        # 只读查看各 VM 运行状态与 SSH 就绪情况
+./manage_vms.sh restart       # 等价于先 stop 再 start（支持 --dry-run 预览）
 ```
 
 部署完成后：
 
 - VM 首次启动约需 2-4 分钟，脚本会轮询等待 22 端口就绪
 - 直接 `ssh machine1` 即可免密登录（所有本地普通用户均已配置别名）
-- 机器/IP/MAC 对照清单写入上级目录 `/data/machine_and_ip_list.txt`
+- 机器/IP/MAC 对照清单写入 `/data/machine_and_ip_list.txt`
 
 ## 麒麟基础镜像制作
 
@@ -161,11 +162,11 @@ KYLIN_IMG_FILE=/path/to/kylin.qcow2 ./deploy_vms.sh deploy kylin-v10
 
 ## macOS (Lima) 平台说明
 
-macOS 上执行 `./deploy_vms.sh` 会自动分发到 Lima 后端（[deploy_vms_mac.sh](deploy_vms_mac.sh)），与 Linux 版的主要差异：
+macOS 上执行 `./deploy_vms.sh` 会自动走内置的 Lima 实现（与 KVM 实现集成在同一脚本内），与 Linux 版的主要差异：
 
 | 项目 | Linux (KVM) | macOS (Lima) |
 |------|-------------|--------------|
-| 配置模型 | `WORKER_COUNT` 自动生成机器名/IP/MAC/规格 | `deploy_vms.env` 的 macOS 配置段按数组逐台配置（`MACHINE_NAMES`/`MACHINE_CPU`/`MACHINE_MEM_GBS`/`MAC_DISK_GB`/`MACHINE_SSH_PORTS`，长度必须一致） |
+| 配置模型 | `WORKER_COUNT` + `RESOURCE_RATIO` + `DISK_GB` 自动生成机器名/规格（共 `WORKER_COUNT+1` 台，末台 VIP） | 与 Linux 完全一致（共用同一批配置项）；macOS 段额外配置 `BASE_SSH_PORT`（首台 SSH 端口，逐台递增）、`VM_TYPE`、镜像路径等 |
 | 网络 | libvirt NAT 静态 IP（DHCP host 按 MAC 绑定） | Lima NAT，宿主机走 `127.0.0.1:<固定SSH端口>` 转发；VM 互解析写入 VM 内 `/etc/hosts` |
 | 登录方式 | `ssh -i <私钥> user@<IP>` / `ssh machine1` 别名 | `ssh machine1` 别名（固定端口，VM 重启后依然有效）；控制台 `limactl shell machine1` |
 | 默认用户 | 麒麟 root / Ubuntu 可配 | `SSH_USER`（默认 root，脚本自动写入 Lima 密钥并放开密钥登录） |

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# deploy_vms.sh — 使用 KVM 在本机部署多台 VM（普通机台数见 deploy_vms.env 的 WORKER_COUNT）
+# deploy_vms.sh — 本机批量部署 Linux VM（自动适配平台: Linux 走 KVM/libvirt，macOS 走 Lima）
 # 内置性能优化: q35 机型 / host-passthrough CPU / CPU 拓扑 sockets=1 / virtio 磁盘网卡 /
 #               磁盘 cache=none + 独立 IO 线程 / kvmvapic.bin ROM 自动补齐（中断优化）/
 #               虚机内自动创建 swapfile（大小见 MACHINE_SWAP_GB，不占宿主机内存）
@@ -16,6 +16,10 @@
 #   ./deploy_vms.sh status                  # 查看 VM 状态
 #   ./deploy_vms.sh ssh-config [ubuntu|kylin-v10]  # 给 root 和所有本地普通用户配置 VM 免密 SSH（默认自动检测已部署 VM 的用户）
 #   ./deploy_vms.sh destroy                 # 销毁本脚本部署的全部 VM 及相关文件
+# macOS 说明:
+#   macOS (Darwin) 上自动走 Lima 实现（本文件内置，原 deploy_vms_mac.sh 已集成），
+#   子命令用法与 Linux 一致；额外支持 --dry-run 预览 / --clean 清洁执行 / --yes 免确认，
+#   执行 ./deploy_vms.sh --help 查看 Lima 专属说明
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,11 +27,8 @@ BASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENV_FILE="$SCRIPT_DIR/deploy_vms.env"
 CACHE_DIR="$SCRIPT_DIR/cache"
 
-# 平台自动分发: macOS (Darwin) 上转交 Lima 后端实现 deploy_vms_mac.sh，
-# 用法/子命令/参数完全一致，Linux 上继续走本文件的 KVM/libvirt 逻辑
-if [[ "$(uname -s)" == "Darwin" ]]; then
-  exec bash "$SCRIPT_DIR/deploy_vms_mac.sh" "$@"
-fi
+# 平台自动分发: macOS (Darwin) 走本文件内的 Lima 实现（原 deploy_vms_mac.sh 已集成），
+# Linux 走本文件的 KVM/libvirt 实现，用法/子命令完全一致
 
 [[ -f "$ENV_FILE" ]] || { echo -e "\033[31m[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR]\033[0m 缺少配置文件: $ENV_FILE"; exit 1; }
 # shellcheck source=/dev/null
@@ -83,10 +84,14 @@ generate_machine_config() {
   # 解析起始机器名（如 machine1 → 前缀 machine + 起始编号 1；node5 → node + 5），
   # 机器名统一按 前缀N、前缀N+1... 排列；前缀需以字母开头（合法主机名）
   local name_prefix name_start_num
-  [[ "$MACHINE_NAME_START" =~ ^([A-Za-z][A-Za-z0-9_-]*?)([0-9]+)$ ]] \
+  # 拆分起始机器名: 前缀为字母开头的字母/数字/下划线/连字符，末尾为纯数字编号
+  # （不用惰性量词正则——macOS 自带 bash 3.2 不支持 *?）
+  name_start_num="$(printf '%s' "$MACHINE_NAME_START" | sed -E 's/^([A-Za-z][A-Za-z0-9_-]*)([0-9]+)$/\2/')" \
+    || true
+  name_prefix="${MACHINE_NAME_START%"$name_start_num"}"
+  [[ -n "$name_start_num" && "$name_prefix" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] \
     || die "MACHINE_NAME_START='$MACHINE_NAME_START' 格式非法，应为如 machine1（主机名前缀+起始编号）"
-  name_prefix="${BASH_REMATCH[1]}"
-  name_start_num=$(( 10#${BASH_REMATCH[2]} ))   # 10# 强制十进制，避免 01/08 被当作八进制
+  name_start_num=$(( 10#$name_start_num ))   # 10# 强制十进制，避免 01/08 被当作八进制
 
   # 解析 IP 起始地址（如 192.168.122.10），IP 在该网段内顺序递增
   local net_prefix start_octet
@@ -161,8 +166,7 @@ generate_machine_config() {
   DISK_GB=("${disks[@]}")
 }
 
-generate_machine_config
-ALL_NAMES=("${MACHINE_NAMES[@]}")
+# 机器配置生成在 kvm_main 内调用（避免 macOS 上覆盖 Lima 所需的同名数组）
 
 select_image() {
   local choice="${1:-}"
@@ -850,11 +854,835 @@ destroy() {
   log "清理完成。仅处理本脚本部署的 VM（${MACHINE_NAMES[*]}）；未扫描或删除其他 libvirt 资源。"
 }
 
-case "${1:-deploy}" in
-  deploy) deploy "${2:-}" ;;
-  status) status ;;
-  ssh-config) configure_ssh_only "${2:-}" ;;
-  destroy) destroy ;;
-  ubuntu|kylin|kylin-v10) deploy "$1" ;;
-  *) die "用法: $0 [deploy [ubuntu|kylin-v10]|ubuntu|kylin-v10|status|ssh-config [ubuntu|kylin-v10]|destroy]" ;;
-esac
+# ----------------------------------------------------------------------------
+# KVM 子命令入口（仅 Linux 调用）
+# ----------------------------------------------------------------------------
+kvm_main() {
+  generate_machine_config
+  ALL_NAMES=("${MACHINE_NAMES[@]}")
+  case "${1:-deploy}" in
+    deploy) deploy "${2:-}" ;;
+    status) status ;;
+    ssh-config) configure_ssh_only "${2:-}" ;;
+    destroy) destroy ;;
+    ubuntu|kylin|kylin-v10) deploy "$1" ;;
+    *) die "用法: $0 [deploy [ubuntu|kylin-v10]|ubuntu|kylin-v10|status|ssh-config [ubuntu|kylin-v10]|destroy]" ;;
+  esac
+}
+
+# ============================================================================
+# macOS (Lima) 后端实现（原 deploy_vms_mac.sh 已集成于此，仅 Darwin 平台调用）
+# ============================================================================
+# ----------------------------------------------------------------------------
+# 路径初始化（全部基于脚本所在目录，不依赖调用者 cwd）
+# ----------------------------------------------------------------------------
+LOG_DIR="$SCRIPT_DIR/logs"
+OUTPUT_DIR="$SCRIPT_DIR/output"
+STATE_DIR="$SCRIPT_DIR/state"
+# Lima 基础镜像缓存目录（相对脚本目录的上级仓库根，与 Linux KVM 共用同一存放位置）
+LIMA_IMG_DIR="$BASE_DIR/qcow2s"
+LOG_FILE="$LOG_DIR/deploy_vms_mac_$(date '+%Y%m%d_%H%M%S').log"
+
+DRY_RUN=0
+CLEAN=0
+CONFIRM_YES=0
+
+# ----------------------------------------------------------------------------
+# 日志（带时间戳、级别、阶段进度 [当前阶段-总阶段]）
+# ----------------------------------------------------------------------------
+STAGE_NO=0
+STAGE_TOTAL=6
+
+log_msg() { # $1=级别 $2=内容
+  local line
+  line="[$(date '+%Y-%m-%d %H:%M:%S')] [$1] [${STAGE_NO}-${STAGE_TOTAL}] $2"
+  echo -e "$line"
+  echo "$line" >> "$LOG_FILE" 2>/dev/null || true
+}
+lima_log()  { log_msg "INFO" "$*"; }
+lima_warn() { log_msg "WARN" "$*"; }
+err()  { log_msg "ERROR" "$*"; }
+lima_die()  { err "$*"; exit 1; }
+
+stage_begin() { STAGE_NO="$1"; lima_log "========== 阶段 $1/$STAGE_TOTAL: $2 =========="; }
+stage_end()   { lima_log "---------- 阶段 $1/$STAGE_TOTAL 完成 ----------"; }
+
+# ----------------------------------------------------------------------------
+# 配置加载
+# ----------------------------------------------------------------------------
+load_config() {
+  [[ -f "$ENV_FILE" ]] || lima_die "缺少配置文件: $ENV_FILE"
+  # shellcheck source=/dev/null
+  source "$ENV_FILE"
+
+  VM_TYPE="${VM_TYPE:-vz}"
+  TIMEZONE="${TIMEZONE:-Asia/Shanghai}"
+  # SSH 登录用户：默认 root（部署后自动为 root 配置密钥免密）
+  SSH_USER="${SSH_USER:-root}"
+  # 麒麟本地镜像路径在 macOS 配置段使用 MAC_KYLIN_IMG_FILE 命名（Linux 段同名变量指向 Linux 路径）
+  KYLIN_IMG_FILE="${MAC_KYLIN_IMG_FILE:-}"
+  MACHINE_MD_FILE="$SCRIPT_DIR/虚拟机配置信息.md"
+
+  # 与 Linux (KVM) 相同的配置模型: WORKER_COUNT + RESOURCE_RATIO 自动生成机器配置
+  lima_generate_machine_config
+}
+
+# ============ 机器配置自动生成（与 Linux KVM 的 generate_machine_config 对齐） ============
+# 配置文件只指定 WORKER_COUNT / RESOURCE_RATIO / DISK_GB / MACHINE_NAME_START / BASE_SSH_PORT，
+# 其余全部自动生成:
+#   机器名: 从 MACHINE_NAME_START 起统一编号排列，最后一台为 VIP 机（共 WORKER_COUNT+1 台）
+#   CPU/内存: 按 RESOURCE_RATIO（普通机份额:VIP机份额）分摊宿主机资源，系数之和恒为 1
+#   磁盘: 普通机取 DISK_GB，VIP 机按比例反向缩放（VIP 磁盘 = DISK_GB × 普通份额/VIP份额）
+#   SSH 端口: 从 BASE_SSH_PORT（默认 60001）起每台递增 1
+#   （无静态 IP/DHCP/MAC/swap 概念——Lima NAT 网络由 Lima 自动管理）
+lima_generate_machine_config() {
+  WORKER_COUNT="${WORKER_COUNT:-2}"
+  RESOURCE_RATIO="${RESOURCE_RATIO:-2:1}"
+  DISK_GB="${DISK_GB:-100}"
+  MACHINE_NAME_START="${MACHINE_NAME_START:-machine1}"
+  BASE_SSH_PORT="${BASE_SSH_PORT:-60001}"
+
+  [[ "$WORKER_COUNT" =~ ^[1-9][0-9]*$ ]] || lima_die "WORKER_COUNT='$WORKER_COUNT' 必须为正整数（deploy_vms.env）"
+  [[ "$DISK_GB" =~ ^[1-9][0-9]*$ ]] || lima_die "DISK_GB='$DISK_GB' 必须为正整数"
+  [[ "$BASE_SSH_PORT" =~ ^[0-9]+$ ]] || lima_die "BASE_SSH_PORT='$BASE_SSH_PORT' 必须为正整数"
+
+  # 解析资源比例（普通机份额:VIP机份额，支持小数，如 2:1、2.5:1）
+  local worker_shares vip_shares
+  [[ "$RESOURCE_RATIO" =~ ^([0-9]+(\.[0-9]+)?):([0-9]+(\.[0-9]+)?)$ ]] \
+    || lima_die "RESOURCE_RATIO='$RESOURCE_RATIO' 格式非法，应为如 2:1 或 2.5:1（普通机份额:VIP机份额，正数）"
+  worker_shares="${BASH_REMATCH[1]}"
+  vip_shares="${BASH_REMATCH[3]}"
+  awk -v w="$worker_shares" -v v="$vip_shares" 'BEGIN{exit !(w>0 && v>0)}' \
+    || lima_die "RESOURCE_RATIO='$RESOURCE_RATIO' 两项份额都必须大于 0"
+
+  # 解析起始机器名（如 machine1 → 前缀 machine + 起始编号 1）
+  # （不用惰性量词正则——macOS 自带 bash 3.2 不支持 *?）
+  local name_prefix name_start_num
+  name_start_num="$(printf '%s' "$MACHINE_NAME_START" | sed -E 's/^([A-Za-z][A-Za-z0-9_-]*)([0-9]+)$/\2/')" \
+    || true
+  name_prefix="${MACHINE_NAME_START%"$name_start_num"}"
+  [[ -n "$name_start_num" && "$name_prefix" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] \
+    || lima_die "MACHINE_NAME_START='$MACHINE_NAME_START' 格式非法，应为如 machine1（主机名前缀+起始编号）"
+  name_start_num=$(( 10#$name_start_num ))   # 10# 强制十进制，避免 01/08 被当作八进制
+
+  MACHINE_NAMES=()
+  MACHINE_CPU=()
+  MACHINE_MEM_GBS=()
+  local -a disks=()
+  MACHINE_SSH_PORTS=()
+
+  # 宿主机资源总量: CPU 系数换算为整数 vCPU，内存系数换算为整数 GiB
+  # （Lima vz 引擎要求 cpus 为整数；小数 GiB 内存换算成 MB 后不是 1MiB 整数倍会被拒绝）
+  local host_cpu host_mem_gb
+  host_cpu="$(sysctl -n hw.ncpu)"
+  host_mem_gb="$(awk -v k="$(sysctl -n hw.memsize)" 'BEGIN{printf "%d", k/1024/1024/1024}')"
+
+  # CPU/内存按份分配（系数之和恒为 1，正好用满宿主机资源不超分）；
+  # 磁盘反向缩放: VIP 磁盘 = DISK_GB × 普通份额/VIP份额
+  local total=$((WORKER_COUNT + 1)) i ratio cpu_v mem_v disk
+  local total_shares
+  total_shares="$(awk -v n="$WORKER_COUNT" -v w="$worker_shares" -v v="$vip_shares" 'BEGIN{printf "%.6f", n*w+v}')"
+  for ((i = 1; i <= total; i++)); do
+    MACHINE_NAMES+=("${name_prefix}$((name_start_num + i - 1))")
+    MACHINE_SSH_PORTS+=("$((BASE_SSH_PORT + i - 1))")
+    if (( i <= WORKER_COUNT )); then
+      ratio="$(awk -v s="$worker_shares" -v t="$total_shares" 'BEGIN{printf "%.6g", s/t}')"
+      disk="$DISK_GB"
+    else
+      ratio="$(awk -v s="$vip_shares" -v t="$total_shares" 'BEGIN{printf "%.6g", s/t}')"
+      disk="$(awk -v d="$DISK_GB" -v w="$worker_shares" -v v="$vip_shares" 'BEGIN{printf "%d", d*w/v}')"
+      (( disk < 1 )) && disk=1
+    fi
+    # 系数 → 绝对值（四舍五入），vCPU 最少 1 核、内存最少 1GiB
+    cpu_v="$(awk -v t="$host_cpu" -v r="$ratio" 'BEGIN{v=int(t*r+0.5); if(v<1)v=1; print v}')"
+    mem_v="$(awk -v t="$host_mem_gb" -v r="$ratio" 'BEGIN{v=int(t*r+0.5); if(v<1)v=1; print v}')"
+    MACHINE_CPU+=("$cpu_v")
+    MACHINE_MEM_GBS+=("$mem_v")
+    disks+=("$disk")
+  done
+  MAC_DISK_GB=("${disks[@]}")
+  DISK_GB=("${disks[@]}")
+}
+
+check_config() {
+  local n="${#MACHINE_NAMES[@]}"
+  if [[ "$n" -eq 0 ]]; then
+    lima_die "配置错误: MACHINE_NAMES 为空，请检查 $ENV_FILE"
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# 参数解析与帮助
+# ----------------------------------------------------------------------------
+usage() {
+  cat <<'EOF'
+deploy_vms.sh (macOS/Lima) — 基于 Lima 批量部署 Linux 虚拟机
+
+用法:
+  ./deploy_vms.sh                          # 交互式选择镜像后部署（默认麒麟 V10）
+  ./deploy_vms.sh deploy kylin-v10         # 使用麒麟 V10 镜像部署
+  ./deploy_vms.sh deploy ubuntu            # 使用 Ubuntu 22.04 镜像部署
+  ./deploy_vms.sh status                   # 查看 VM 状态
+  ./deploy_vms.sh ssh-config               # 仅配置本机 SSH 免密别名
+  ./deploy_vms.sh destroy                  # 销毁配置中定义的全部 VM（有确认）
+
+子命令:
+  deploy [kylin-v10|ubuntu]   部署全部 VM（不指定镜像时交互式选择，非终端默认 kylin-v10）
+  status                      查看 VM 状态
+  ssh-config                  给本机用户配置 VM 免密 SSH 别名
+  destroy                     销毁 deploy_vms.env 中定义的全部 VM
+
+全局选项:
+  -h, --help                  显示本帮助
+  --dry-run                   预览模式：只打印将执行的危险操作，不实际执行
+  --clean                     清洁执行：部署前先删除已有 VM 与状态文件
+  --yes                       destroy 免确认（配合自动化）
+
+依赖:
+  limactl (brew install lima)、qemu-img（brew install qemu）、macOS 13+
+
+日志/产物:
+  logs/      执行日志（deploy_vms_mac_*.log）
+  output/    生成的 Lima YAML 模板
+  ../qcow2s/ 基础镜像缓存（仓库根目录，相对脚本位置）
+  state/     断点续跑状态文件
+
+风险提示:
+  destroy / --clean 会强制停止并删除 VM 及其磁盘数据，不可恢复。
+EOF
+}
+
+parse_args() {
+  ACTION="deploy"
+  IMAGE_CHOICE="kylin-v10"
+  IMAGE_SPECIFIED=0
+  local arg
+  # 允许全局选项与子命令以任意顺序出现
+  for arg in "$@"; do
+    case "$arg" in
+      -h|--help) usage; exit 0 ;;
+      --dry-run) DRY_RUN=1 ;;
+      --clean)   CLEAN=1 ;;
+      --yes)     CONFIRM_YES=1 ;;
+      deploy)    ACTION="deploy" ;;
+      status)    ACTION="status" ;;
+      ssh-config) ACTION="ssh-config" ;;
+      destroy)   ACTION="destroy" ;;
+      ubuntu|Ubuntu|UBUNTU) ACTION="deploy"; IMAGE_CHOICE="ubuntu"; IMAGE_SPECIFIED=1 ;;
+      kylin|kylin-v10|Kylin|KYLIN) ACTION="deploy"; IMAGE_CHOICE="kylin-v10"; IMAGE_SPECIFIED=1 ;;
+      *)         err "未知参数: $arg"; usage; exit 1 ;;
+    esac
+  done
+}
+
+# ----------------------------------------------------------------------------
+# 前置检查：依赖、架构、端口占用、目录可写
+# ----------------------------------------------------------------------------
+lima_ensure_deps() {
+  command -v limactl >/dev/null 2>&1 || lima_die "缺少 limactl，请先执行: brew install lima"
+  command -v qemu-img >/dev/null 2>&1 || lima_warn "缺少 qemu-img（vz 引擎转换 qcow2 镜像时需要），如创建 VM 报错请执行: brew install qemu"
+  command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || lima_warn "缺少 curl/wget，在线下载镜像将失败"
+  [[ "$(uname -s)" == "Darwin" ]] || lima_die "本脚本仅适用于 macOS"
+  [[ "$(uname -m)" == "arm64" ]] || lima_warn "当前架构非 arm64，请确认镜像为对应架构"
+}
+
+check_ports_free() {
+  local i port
+  for i in "${!MACHINE_NAMES[@]}"; do
+    port="${MACHINE_SSH_PORTS[$i]}"
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+      lima_warn "端口 $port 已被占用（VM ${MACHINE_NAMES[$i]} 创建后可能无法 SSH）"
+    fi
+  done
+}
+
+ensure_dirs() {
+  local d
+  for d in "$LOG_DIR" "$OUTPUT_DIR" "$LIMA_IMG_DIR" "$STATE_DIR"; do
+    mkdir -p "$d" 2>/dev/null || lima_die "目录不可创建: $d"
+    [[ -w "$d" ]] || lima_die "目录不可写: $d"
+  done
+}
+
+# ----------------------------------------------------------------------------
+# 镜像选择与准备（幂等：缓存中已存在则跳过）
+# ----------------------------------------------------------------------------
+IMAGE_USER=""
+BASE_IMG=""
+IMAGE_SPECIFIED=0
+
+lima_select_image() {
+  # 未通过命令行参数指定镜像时，在终端交互式选择；非终端环境使用默认 kylin-v10
+  if [[ "$IMAGE_SPECIFIED" -ne 1 ]]; then
+    if [[ -t 0 ]]; then
+      echo "请选择部署镜像:"
+      echo "  1) 麒麟 V10 (arm64) [默认]"
+      echo "  2) Ubuntu 22.04 (arm64)"
+      local choice=""
+      read -r -p "请输入 [1/2]（回车默认 1）: " choice </dev/tty || choice=""
+      case "$choice" in
+        2) IMAGE_CHOICE="ubuntu" ;;
+        *) IMAGE_CHOICE="kylin-v10" ;;
+      esac
+    else
+      lima_log "未指定镜像参数且非交互终端，使用默认镜像: kylin-v10"
+    fi
+  fi
+  case "$IMAGE_CHOICE" in
+    ubuntu|Ubuntu|UBUNTU|1)
+      IMAGE_CHOICE="ubuntu"
+      IMAGE_USER="ubuntu"
+      BASE_IMG="$LIMA_IMG_DIR/ubuntu-22.04-arm64-base.qcow2"
+      lima_log "部署镜像: Ubuntu 22.04 (arm64)"
+      ;;
+    kylin|kylin-v10|Kylin|KYLIN|2)
+      IMAGE_CHOICE="kylin-v10"
+      IMAGE_USER="kylin"
+      BASE_IMG="$LIMA_IMG_DIR/kylin-v10-arm64-base.qcow2"
+      lima_log "部署镜像: 麒麟 V10 (arm64)"
+      ;;
+    *)
+      lima_die "未知镜像类型: ${IMAGE_CHOICE}（可选: ubuntu, kylin-v10）"
+      ;;
+  esac
+}
+
+download_file() { # $1=url $2=目标文件
+  local url="$1" dst="$2"
+  lima_log "下载: $url"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --retry 2 -o "$dst.part" "$url" && mv -f "$dst.part" "$dst"
+  else
+    wget -q -O "$dst.part" "$url" && mv -f "$dst.part" "$dst"
+  fi
+}
+
+prepare_base_image() {
+  if [[ -f "$BASE_IMG" ]]; then
+    lima_log "基础镜像已存在，跳过: $BASE_IMG"
+    return 0
+  fi
+
+  if [[ "$IMAGE_CHOICE" == "kylin-v10" ]]; then
+    if [[ -n "${KYLIN_IMG_FILE:-}" && -f "$KYLIN_IMG_FILE" ]]; then
+      lima_log "使用本地麒麟镜像: $KYLIN_IMG_FILE"
+      cp "$KYLIN_IMG_FILE" "$BASE_IMG"
+      return 0
+    fi
+    if [[ -n "${KYLIN_IMG_URL:-}" ]]; then
+      download_file "$KYLIN_IMG_URL" "$BASE_IMG" && return 0
+      lima_warn "麒麟镜像下载失败: $KYLIN_IMG_URL"
+    fi
+    lima_die "未找到麒麟 arm64 镜像。请在 $ENV_FILE 中将 KYLIN_IMG_FILE 指向本地 aarch64 qcow2 云镜像，或配置 KYLIN_IMG_URL 后重试"
+  fi
+
+  # ubuntu 22.04 arm64
+  local img_name="jammy-server-cloudimg-arm64.img"
+  download_file "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cloud-images/jammy/current/$img_name" "$BASE_IMG" \
+    || download_file "https://cloud-images.ubuntu.com/jammy/current/$img_name" "$BASE_IMG" \
+    || lima_die "Ubuntu 基础镜像下载失败"
+}
+
+# ----------------------------------------------------------------------------
+# 生成 Lima YAML 模板
+# ----------------------------------------------------------------------------
+gen_vm_yaml() { # $1=vm名 $2=cpu $3=memGiB $4=diskGiB $5=sshPort
+  local name="$1" cpu="$2" mem="$3" disk="$4" port="$5"
+  local yaml="$OUTPUT_DIR/$name.yaml"
+  cat > "$yaml" <<EOF
+# 由 deploy_vms.sh 生成，勿手工修改
+vmType: $VM_TYPE
+os: Linux
+arch: aarch64
+images:
+  - location: "file://$BASE_IMG"
+    arch: "aarch64"
+cpus: $cpu
+memory: "${mem}GiB"
+disk: "${disk}GiB"
+timezone: $TIMEZONE
+ssh:
+  localPort: $port
+mounts: []
+containerd:
+  system: false
+  user: false
+user:
+  name: $IMAGE_USER
+  comment: vm-deploy user
+  home: /home/$IMAGE_USER
+  shell: /bin/bash
+  passwordlessSudo: true
+EOF
+  echo "$yaml"
+}
+
+# ----------------------------------------------------------------------------
+# VM 状态查询（返回状态字符串，未创建返回空）
+# ----------------------------------------------------------------------------
+vm_state() { # $1=vm名
+  limactl list --format '{{ .Status }}' "$1" 2>/dev/null || true
+}
+
+vm_exists() {
+  [[ -n "$(vm_state "$1")" ]]
+}
+
+mark_state() { # $1=vm名 $2=标记(created/configured)
+  echo "$2" > "$STATE_DIR/$1.$2.state"
+}
+
+# 记录/读取部署时选定的镜像用户与 SSH 登录用户（供 ssh-config 等 after 阶段使用，避免二次选择出错）
+save_image_user() {
+  echo "$IMAGE_USER" > "$STATE_DIR/image_user.state"
+  echo "$SSH_USER" > "$STATE_DIR/ssh_user.state"
+}
+
+load_image_user() {
+  if [[ -f "$STATE_DIR/image_user.state" ]]; then
+    IMAGE_USER="$(cat "$STATE_DIR/image_user.state")"
+    IMAGE_CHOICE="from-state"
+    if [[ -f "$STATE_DIR/ssh_user.state" ]]; then
+      SSH_USER="$(cat "$STATE_DIR/ssh_user.state")"
+    fi
+    lima_log "使用部署时记录的镜像用户: ${IMAGE_USER}，SSH 登录用户: ${SSH_USER}（状态文件: $STATE_DIR/image_user.state）"
+    return 0
+  fi
+  return 1
+}
+
+# ----------------------------------------------------------------------------
+# 创建 VM（幂等：已存在跳过）
+# ----------------------------------------------------------------------------
+create_vms() {
+  local i name cpu mem disk port yaml
+  for i in "${!MACHINE_NAMES[@]}"; do
+    name="${MACHINE_NAMES[$i]}"; cpu="${MACHINE_CPU[$i]}"; mem="${MACHINE_MEM_GBS[$i]}"
+    disk="${DISK_GB[$i]}"; port="${MACHINE_SSH_PORTS[$i]}"
+
+    if vm_exists "$name"; then
+      lima_log "VM $name 已存在，跳过创建（如需重建: $0 destroy 后重新部署）"
+      continue
+    fi
+
+    yaml="$(gen_vm_yaml "$name" "$cpu" "$mem" "$disk" "$port")"
+    lima_log "创建 VM: $name (CPU=$cpu MEM=${mem}GiB DISK=${disk}GiB SSH端口=$port 镜像=$BASE_IMG)"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      lima_log "[dry-run] 将执行: limactl create --name=$name --tty=false $yaml"
+      continue
+    fi
+    limactl create --tty=false --name="$name" "$yaml" || lima_die "创建 VM 失败: $name"
+    mark_state "$name" "created"
+  done
+}
+
+# ----------------------------------------------------------------------------
+# 启动 VM 并等待 SSH 端口就绪（幂等：Running 跳过）
+# ----------------------------------------------------------------------------
+port_ready() { # $1=127.0.0.1端口
+  (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && { exec 3>&- 3<&-; return 0; }
+  return 1
+}
+
+start_and_wait_vms() {
+  local i name port state attempt
+  for i in "${!MACHINE_NAMES[@]}"; do
+    name="${MACHINE_NAMES[$i]}"; port="${MACHINE_SSH_PORTS[$i]}"
+    state="$(vm_state "$name")"
+    if [[ "$state" == "Running" ]]; then
+      lima_log "VM $name 已在运行，跳过启动"
+    else
+      lima_log "启动 VM: ${name}（当前状态: ${state:-未创建}）"
+      if [[ "$DRY_RUN" -eq 1 ]]; then
+        lima_log "[dry-run] 将执行: limactl start --tty=false $name"
+        continue
+      fi
+      limactl start --tty=false "$name" || lima_die "启动 VM 失败: $name"
+    fi
+
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+      lima_log "等待 ${name} SSH 端口就绪 (127.0.0.1:${port}，首次启动约 2-5 分钟)..."
+      for attempt in $(seq 1 100); do
+        if port_ready "$port"; then
+          lima_log "$name 已就绪: ssh $name"
+          break
+        fi
+        [[ "$attempt" -eq 100 ]] && lima_warn "$name 等待 SSH 超时，可稍后手动检查: limactl shell $name"
+        sleep 3
+      done
+    fi
+  done
+}
+
+# ----------------------------------------------------------------------------
+# 后置配置：VM 内 /etc/hosts 互解析、机器/IP 清单、SSH 免密别名
+# ----------------------------------------------------------------------------
+resolve_guest_ip() { # $1=vm名，输出 IP（失败输出空）
+  local ip=""
+  ip="$(limactl shell "$1" -- hostname -I 2>/dev/null | awk '{print $1}')" || true
+  if [[ -z "$ip" ]]; then
+    ip="$(limactl shell "$1" -- sh -c "ip -4 addr show scope global 2>/dev/null" 2>/dev/null \
+      | awk '/inet /{split($2,a,"/"); print a[1]; exit}')" || true
+  fi
+  echo "$ip"
+}
+
+write_guest_hosts() {
+  # 先统一解析所有 VM 的 guest IP
+  GUEST_IPS=()
+  local i name ip
+  for i in "${!MACHINE_NAMES[@]}"; do
+    GUEST_IPS+=("")
+  done
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+  for i in "${!MACHINE_NAMES[@]}"; do
+    name="${MACHINE_NAMES[$i]}"
+    ip="$(resolve_guest_ip "$name")"
+    GUEST_IPS[$i]="$ip"
+    if [[ -z "$ip" ]]; then
+      lima_warn "无法获取 $name 的 guest IP（VM 内 hosts 互解析将不完整）"
+    else
+      lima_log "VM $name guest IP: $ip"
+    fi
+  done
+  # 写入每台 VM 的 /etc/hosts
+  for i in "${!MACHINE_NAMES[@]}"; do
+    name="${MACHINE_NAMES[$i]}"
+    [[ -n "${GUEST_IPS[$i]}" ]] || continue
+    local hosts_line=""
+    for j in "${!MACHINE_NAMES[@]}"; do
+      [[ -n "${GUEST_IPS[$j]}" ]] || continue
+      hosts_line="${hosts_line}${GUEST_IPS[$j]} ${MACHINE_NAMES[$j]}"$'\n'
+    done
+    lima_log "写入 $name 的 VM 内 /etc/hosts"
+    printf '%s' "$hosts_line" | limactl shell "$name" -- sudo sh -c '
+      sed -i "/[[:space:]]machine[0-9]\+$/d" /etc/hosts
+      cat >> /etc/hosts
+    ' >/dev/null 2>&1 || lima_warn "写入 $name VM 内 hosts 失败（不影响部署）"
+    mark_state "$name" "configured"
+  done
+}
+
+# ----------------------------------------------------------------------------
+# 为 SSH_USER 配置 VM 内免密（默认 root）：写入 Lima 公钥并放开密钥登录
+# 幂等：重复执行结果一致
+# ----------------------------------------------------------------------------
+setup_ssh_user() {
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+  [[ "$SSH_USER" == "$IMAGE_USER" ]] && return 0   # 登录用户即初始化用户，无需额外配置
+  local i name
+  for i in "${!MACHINE_NAMES[@]}"; do
+    name="${MACHINE_NAMES[$i]}"
+    lima_log "为 $name 配置 SSH 登录用户 ${SSH_USER}（基于 ${IMAGE_USER} 的密钥）"
+    limactl shell "$name" -- sudo sh -c '
+      set -e
+      login_user="'"$SSH_USER"'"
+      home_dir="$(getent passwd "$login_user" | cut -d: -f6)"
+      [ -n "$home_dir" ] || { echo "用户不存在: $login_user" >&2; exit 1; }
+      mkdir -p "$home_dir/.ssh"
+      for u in '"$IMAGE_USER"' '"$SSH_USER"'; do
+        u_home="$(getent passwd "$u" | cut -d: -f6)"
+        [ -n "$u_home" ] && [ -s "$u_home/.ssh/authorized_keys" ] && cat "$u_home/.ssh/authorized_keys"
+      done | sort -u > "$home_dir/.ssh/authorized_keys"
+      chown -R "$login_user" "$home_dir/.ssh"
+      chmod 700 "$home_dir/.ssh"
+      chmod 600 "$home_dir/.ssh/authorized_keys"
+      if [ "$login_user" = "root" ]; then
+        if grep -q "^PermitRootLogin" /etc/ssh/sshd_config; then
+          sed -i "s/^PermitRootLogin.*/PermitRootLogin prohibit-password/" /etc/ssh/sshd_config
+        else
+          echo "PermitRootLogin prohibit-password" >> /etc/ssh/sshd_config
+        fi
+      fi
+      systemctl restart ssh 2>/dev/null || service ssh restart 2>/dev/null || true
+    ' >/dev/null 2>&1 || lima_warn "为 ${SSH_USER} 配置免密失败: ${name}（可重跑 ./deploy_vms.sh deploy 补配）"
+  done
+}
+
+lima_write_machine_md() {
+  local i name cpu mem disk port ip
+  {
+    echo "# 虚拟机配置信息（macOS / Lima）"
+    echo
+    echo "> 由 deploy_vms.sh 生成于 $(date '+%Y-%m-%d %H:%M:%S')"
+    echo
+    echo "| 机器名 | guest IP | CPU | 内存 | 磁盘 | SSH 端口 | 登录方式 |"
+    echo "|--------|----------|-----|------|------|----------|----------|"
+    for i in "${!MACHINE_NAMES[@]}"; do
+      name="${MACHINE_NAMES[$i]}"; cpu="${MACHINE_CPU[$i]}"; mem="${MACHINE_MEM_GBS[$i]}"
+      disk="${DISK_GB[$i]}"; port="${MACHINE_SSH_PORTS[$i]}"; ip="${GUEST_IPS[$i]:-待获取}"
+      printf "| %s | %s | %s 核 | %sGiB | %sGiB | %s | ssh %s (用户: %s) |\n" \
+        "$name" "$ip" "$cpu" "$mem" "$disk" "$port" "$name" "$SSH_USER"
+    done
+    echo
+    echo "镜像类型: ${IMAGE_CHOICE}；VM 类型: ${VM_TYPE}"
+  } > "$MACHINE_MD_FILE"
+  lima_log "机器配置信息已保存: $MACHINE_MD_FILE"
+}
+
+# ----------------------------------------------------------------------------
+# SSH 免密别名（本机当前用户 + 可提权时覆盖所有可登录用户）
+# ----------------------------------------------------------------------------
+# 当前用户使用的 Lima 私钥；为其他用户写入时通过 VM_DEPLOY_IDENTITY 覆盖为其目录内的副本
+LIMA_IDENTITY="${VM_DEPLOY_IDENTITY:-$HOME/.lima/_config/user}"
+
+lima_write_one_ssh_config() { # $1=home目录 $2=该用户使用的私钥路径
+  # 注意：不能在同一行 local 里先定义后引用（set -u 下会报 unbound variable）
+  local home="$1" identity="$2" tmp i
+  local ssh_dir="$home/.ssh"
+  local ssh_config="$home/.ssh/config"
+  mkdir -p "$ssh_dir" 2>/dev/null || { lima_warn "无法创建 ${ssh_dir}，跳过该用户"; return 0; }
+  touch "$ssh_config" || { lima_warn "无法写入 ${ssh_config}，跳过该用户"; return 0; }
+
+  tmp="$(mktemp)"
+  awk '
+    /^# BEGIN vm_deploy$/ { skip=1; next }
+    /^# END vm_deploy$/   { skip=0; next }
+    /^Host machine[0-9]+/ { skip_legacy=1; next }
+    /^Host / && skip_legacy { skip_legacy=0 }
+    !skip && !skip_legacy { print }
+  ' "$ssh_config" > "$tmp"
+
+  {
+    cat "$tmp"
+    echo "# BEGIN vm_deploy"
+    for i in "${!MACHINE_NAMES[@]}"; do
+      printf "Host %s %s@%s\n" "${MACHINE_NAMES[$i]}" "$SSH_USER" "${MACHINE_NAMES[$i]}"
+      printf "  HostName 127.0.0.1\n"
+      printf "  Port %s\n" "${MACHINE_SSH_PORTS[$i]}"
+      printf "  User %s\n" "$SSH_USER"
+      printf "  IdentityFile %s\n" "$identity"
+      printf "  StrictHostKeyChecking no\n"
+      printf "  UserKnownHostsFile /dev/null\n\n"
+    done
+    echo "# END vm_deploy"
+  } > "$ssh_config"
+  rm -f "$tmp"
+}
+
+lima_write_ssh_config() {
+  [[ -f "$LIMA_IDENTITY" ]] || lima_warn "Lima 用户密钥尚未生成: ${LIMA_IDENTITY}（首次创建 VM 后自动生成，可稍后重跑 ssh-config）"
+
+  lima_write_one_ssh_config "$HOME" "$LIMA_IDENTITY"
+  chmod 700 "$HOME/.ssh" 2>/dev/null || true
+  chmod 600 "$HOME/.ssh/config" 2>/dev/null || true
+  lima_log "SSH 免密别名已写入: $HOME/.ssh/config"
+
+  # 尝试覆盖其他本地可登录用户（需要无交互 sudo 权限；密钥需复制到各用户目录）
+  if sudo -n true 2>/dev/null; then
+    while IFS=: read -r user _ uid _ _ home shell; do
+      [[ "$user" == "$USER" ]] && continue
+      [[ "$uid" -ge 501 ]] || continue
+      [[ -d "$home" ]] || continue
+      [[ "$shell" != */false && "$shell" != */usr/bin/false && "$shell" != */nologin ]] || continue
+      local user_identity="$home/.ssh/id_rsa_vm_deploy"
+      sudo mkdir -p "$home/.ssh" 2>/dev/null || { lima_warn "无法创建 $home/.ssh，跳过用户 $user"; continue; }
+      if [[ -f "$LIMA_IDENTITY" ]]; then
+        sudo cp "$LIMA_IDENTITY" "$user_identity" 2>/dev/null || { lima_warn "复制密钥到 $user_identity 失败，跳过用户 $user"; continue; }
+        sudo chown "$user" "$user_identity" "$home/.ssh" 2>/dev/null || true
+        sudo chmod 600 "$user_identity" 2>/dev/null || true
+      fi
+      # 以该用户身份重跑本脚本 ssh-config（写入其 $home/.ssh/config，并指向其目录内的密钥副本）
+      if sudo -u "$user" -H VM_DEPLOY_IDENTITY="$user_identity" bash "$0" ssh-config >/dev/null 2>&1; then
+        lima_log "SSH 免密别名已写入: $home/.ssh/config (用户 $user)"
+      else
+        lima_warn "写入用户 $user 的 ssh config 失败，可手动为其执行: sudo -u $user $0 ssh-config"
+      fi
+    done < /etc/passwd
+  else
+    lima_warn "无无交互 sudo 权限，仅配置了当前用户；如需所有本地用户免密，请用 sudo 重跑: sudo -E $0 ssh-config"
+  fi
+}
+
+cleanup_ssh_config() {
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+  local home
+  for home in "$HOME"; do
+    [[ -f "$home/.ssh/config" ]] || continue
+    grep -q "^# BEGIN vm_deploy" "$home/.ssh/config" || continue
+    awk '
+      /^# BEGIN vm_deploy$/ { skip=1; next }
+      /^# END vm_deploy$/   { skip=0; next }
+      !skip { print }
+    ' "$home/.ssh/config" > "$home/.ssh/config.tmp" \
+      && mv "$home/.ssh/config.tmp" "$home/.ssh/config"
+  done
+  lima_log "已清理本机 ssh config 中的 vm_deploy 别名"
+}
+
+# ----------------------------------------------------------------------------
+# 结果汇总
+# ----------------------------------------------------------------------------
+summary() {
+  local i
+  echo
+  lima_log "=========== 部署完成 ==========="
+  printf "%-16s %-18s %-14s %s\n" "VM" "IP" "SSH端口" "登录方式"
+  for i in "${!MACHINE_NAMES[@]}"; do
+    printf "%-16s %-18s %-14s %s\n" "${MACHINE_NAMES[$i]}" "${GUEST_IPS[$i]:-待获取}" "${MACHINE_SSH_PORTS[$i]}" "ssh ${MACHINE_NAMES[$i]}  (用户: ${SSH_USER})"
+  done
+  echo "================================"
+}
+
+# ----------------------------------------------------------------------------
+# destroy：删除配置中定义的全部 VM（危险操作，需确认 / 支持 dry-run）
+# ----------------------------------------------------------------------------
+destroy_lima() {
+  local i name state found=0
+  local -a existing=()
+  for i in "${!MACHINE_NAMES[@]}"; do
+    name="${MACHINE_NAMES[$i]}"
+    if vm_exists "$name"; then
+      existing+=("$name"); found=$((found+1))
+    fi
+  done
+
+  if [[ "$found" -eq 0 ]]; then
+    lima_log "未发现配置中定义的任何 Lima VM，无需清理。"
+    cleanup_ssh_config
+    return 0
+  fi
+
+  echo
+  lima_warn "危险操作：即将停止并删除以下 ${found} 台 Lima VM 及其全部磁盘数据（不可恢复）："
+  lima_warn "  ${existing[*]}"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    lima_log "[dry-run] 将执行: limactl delete -f <上述VM>，并清理 ssh 别名/状态文件"
+    return 0
+  fi
+  if [[ "$CONFIRM_YES" -ne 1 ]]; then
+    local confirm
+    read -r -p "确认继续请输入 yes: " confirm
+    [[ "$confirm" == "yes" ]] || { lima_log "已取消 destroy 操作，未做任何更改。"; return 0; }
+  fi
+
+  for name in "${existing[@]}"; do
+    state="$(vm_state "$name")"
+    lima_log "删除 VM: ${name}（当前状态: ${state}）"
+    limactl delete --force "$name" >/dev/null 2>&1 || lima_warn "删除 VM 失败: $name"
+    rm -f "$STATE_DIR/$name".*.state "$OUTPUT_DIR/$name.yaml"
+  done
+
+  cleanup_ssh_config
+  rm -f "$STATE_DIR/image_user.state" "$STATE_DIR/ssh_user.state"
+  [[ -f "$MACHINE_MD_FILE" ]] && rm -f "$MACHINE_MD_FILE" && lima_log "已删除机器配置信息: $MACHINE_MD_FILE"
+  lima_log "清理完成。基础镜像缓存保留在 ${LIMA_IMG_DIR}（如需彻底清理请手动删除）。"
+}
+
+# ----------------------------------------------------------------------------
+# clean：清洁执行前的清理（删除 VM + 状态 + 生成物）
+# ----------------------------------------------------------------------------
+clean_all() {
+  lima_log "清洁执行：删除已有 VM、状态文件与生成物后重新部署"
+  destroy_lima
+}
+
+# ----------------------------------------------------------------------------
+# 子命令入口
+# ----------------------------------------------------------------------------
+do_deploy() {
+  stage_begin 1 "加载配置与校验"
+  load_config
+  check_config
+  lima_select_image
+  ensure_dirs
+  save_image_user
+  stage_end 1
+
+  stage_begin 2 "前置检查"
+  lima_ensure_deps
+  ensure_dirs
+  check_ports_free
+  [[ "$CLEAN" -eq 1 ]] && clean_all
+  stage_end 2
+
+  stage_begin 3 "准备基础镜像"
+  prepare_base_image
+  stage_end 3
+
+  stage_begin 4 "创建 VM"
+  create_vms
+  stage_end 4
+
+  stage_begin 5 "启动并等待就绪"
+  start_and_wait_vms
+  stage_end 5
+
+  stage_begin 6 "后置配置与汇总"
+  write_guest_hosts
+  setup_ssh_user
+  lima_write_machine_md
+  lima_write_ssh_config
+  summary
+  stage_end 6
+}
+
+do_status() {
+  STAGE_TOTAL=1; STAGE_NO=1
+  load_config
+  local i name state ip
+  printf "%-16s %-12s %-18s %s\n" "VM" "状态" "IP" "SSH端口"
+  for i in "${!MACHINE_NAMES[@]}"; do
+    name="${MACHINE_NAMES[$i]}"
+    state="$(vm_state "$name")"
+    if [[ -z "$state" ]]; then
+      printf "%-16s %-12s %-18s %s\n" "$name" "未部署" "-" "${MACHINE_SSH_PORTS[$i]}"
+    else
+      ip="$(resolve_guest_ip "$name" 2>/dev/null || true)"
+      printf "%-16s %-12s %-18s %s\n" "$name" "$state" "${ip:-未知}" "${MACHINE_SSH_PORTS[$i]}"
+    fi
+  done
+}
+
+do_ssh_config() {
+  STAGE_TOTAL=2
+  stage_begin 1 "加载配置"
+  load_config
+  check_config
+  ensure_dirs
+  # 优先使用部署时记录的镜像/SSH 用户；无记录时才走镜像选择（非交互终端会退回默认值）
+  load_image_user || lima_select_image
+  # SSH 登录用户非初始化用户时，先在 VM 内补配免密（幂等）
+  setup_ssh_user
+  stage_end 1
+  stage_begin 2 "写入 SSH 别名"
+  lima_write_ssh_config
+  stage_end 2
+}
+
+do_destroy() {
+  STAGE_TOTAL=2
+  stage_begin 1 "加载配置"
+  load_config
+  check_config
+  ensure_dirs
+  stage_end 1
+  stage_begin 2 "销毁 VM"
+  destroy_lima
+  stage_end 2
+}
+
+# ----------------------------------------------------------------------------
+# 主入口
+# ----------------------------------------------------------------------------
+lima_main() {
+  mkdir -p "$LOG_DIR" 2>/dev/null || true
+  parse_args "$@"
+  lima_log "日志文件: $LOG_FILE"
+  [[ "$DRY_RUN" -eq 1 ]] && lima_log "已启用 dry-run 预览模式"
+  case "$ACTION" in
+    deploy)     do_deploy ;;
+    status)     do_status ;;
+    ssh-config) do_ssh_config ;;
+    destroy)    do_destroy ;;
+  esac
+}
+
+# ----------------------------------------------------------------------------
+# 主入口：按平台分发（macOS → Lima 实现；Linux → KVM/libvirt 实现）
+# ----------------------------------------------------------------------------
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  lima_main "$@"
+else
+  kvm_main "$@"
+fi
