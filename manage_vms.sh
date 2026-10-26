@@ -285,7 +285,7 @@ status_lima() {
     fi
     if [[ "$state" == "Running" ]]; then
       if port_ready "$port"; then
-        status_msg "$name: Running，SSH 已就绪 (127.0.0.1:$port，ssh $name)"
+        status_msg "$name: Running，SSH 已就绪 (127.0.0.1:${port}，ssh $name)"
       else
         status_msg "$name: Running，SSH 未就绪 (127.0.0.1:$port 不通)"
       fi

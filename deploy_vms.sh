@@ -6,13 +6,15 @@
 # 开机自启动: 所有 VM 注册为 libvirt autostart，宿主机重启后随 libvirtd 自动拉起
 #               （libvirtd 与 default 网络也在部署时一并设置 enable/autostart）
 # 机器配置自动生成: 机器名/静态 IP/随机 MAC/磁盘/swap 均按 WORKER_COUNT 自动生成，
-#               实际部署台数 = WORKER_COUNT + 1（额外 1 台 VIP 机）
+#               默认额外部署 1 台 VIP 机（DEPLOY_VIP=1，实际台数 = WORKER_COUNT + 1；
+#               设 DEPLOY_VIP=0 则只部署 WORKER_COUNT 台普通机）
 #               CPU/内存按份均分: 共 WORKER_COUNT*2+1 份，普通机各占 2 份，VIP 机占 1 份
+#               （DEPLOY_VIP=0 时共 WORKER_COUNT*2 份，普通机各占一半）
 # 用法:
-#   ./deploy_vms.sh                         # 交互式列出可装系统类型并选择后部署（非交互环境默认麒麟 V10）
+#   ./deploy_vms.sh                         # 交互式列出 qcow2s 目录下可用原始镜像并选择后部署
 #   ./deploy_vms.sh deploy                  # 同上
-#   ./deploy_vms.sh deploy ubuntu           # 使用 Ubuntu 22.04 镜像部署（无交互）
-#   ./deploy_vms.sh deploy kylin-v10        # 使用麒麟 V10 镜像部署（无交互）
+#   ./deploy_vms.sh deploy ubuntu           # 按关键字匹配文件名含 ubuntu 的镜像部署（无交互）
+#   ./deploy_vms.sh deploy kylin-v10        # 按关键字匹配文件名含 kylin 的镜像部署（无交互）
 #   ./deploy_vms.sh status                  # 查看 VM 状态
 #   ./deploy_vms.sh ssh-config [ubuntu|kylin-v10]  # 给 root 和所有本地普通用户配置 VM 免密 SSH（默认自动检测已部署 VM 的用户）
 #   ./deploy_vms.sh destroy                 # 销毁本脚本部署的全部 VM 及相关文件
@@ -50,9 +52,9 @@ warn() { echo -e "\033[33m[$(TS)] [WARN]\033[0m $*"; }
 die()  { echo -e "\033[31m[$(TS)] [ERROR]\033[0m $*"; exit 1; }
 
 # ============ 机器配置自动生成 ============
-# 配置文件只指定 WORKER_COUNT（普通机台数），其余全部自动生成：
+# 配置文件只指定 WORKER_COUNT（普通机台数）与 DEPLOY_VIP（是否部署 VIP 机），其余全部自动生成：
 #   机器名: 从 MACHINE_NAME_START（默认 machine1，可自定义前缀如 node5）起统一编号排列，
-#           最后一台为 VIP 机（共 WORKER_COUNT+1 台）
+#           共 WORKER_COUNT 台普通机；DEPLOY_VIP=1 时末尾追加 1 台 VIP 机（共 WORKER_COUNT+1 台）
 #   CPU/内存: 按 RESOURCE_RATIO（默认 2:1，普通机份额:VIP机份额）分摊宿主机资源，
 #           系数之和恒为 1（正好用满不超分）
 #   IP:     从 IP_START（默认 192.168.122.10）起顺序递增
@@ -67,8 +69,10 @@ generate_machine_config() {
   MACHINE_SWAP_GB="${MACHINE_SWAP_GB:-16}"
   IP_START="${IP_START:-192.168.122.10}"
   MACHINE_NAME_START="${MACHINE_NAME_START:-machine1}"
+  DEPLOY_VIP="${DEPLOY_VIP:-1}"
 
   [[ "$WORKER_COUNT" =~ ^[1-9][0-9]*$ ]] || die "WORKER_COUNT='$WORKER_COUNT' 必须为正整数（deploy_vms.env）"
+  [[ "$DEPLOY_VIP" =~ ^[01]$ ]] || die "DEPLOY_VIP='$DEPLOY_VIP' 只能为 0 或 1（1=部署 VIP 机，0=不部署）"
   [[ "$DISK_GB" =~ ^[1-9][0-9]*$ ]] || die "DISK_GB='$DISK_GB' 必须为正整数"
   [[ "$MACHINE_SWAP_GB" =~ ^[0-9]+$ ]] || die "MACHINE_SWAP_GB='$MACHINE_SWAP_GB' 必须为非负整数（0=不创建 swap）"
 
@@ -125,9 +129,10 @@ generate_machine_config() {
   # CPU/内存按份分配: 资源共 total_shares 份（=台数*普通份额+VIP份额，支持小数份额），
   # 系数之和恰为 1，正好用满宿主机资源不超分；磁盘/swap 反向缩放：
   # VIP 份额越小（CPU/内存越少），磁盘/swap 反而越大（VIP 机磁盘 = 配置值 * 普通份额/VIP份额）
-  local total=$((WORKER_COUNT + 1)) i mac dup existing ratio disk swap
+  local total=$((WORKER_COUNT + DEPLOY_VIP)) i mac dup existing ratio disk swap
   local total_shares
-  total_shares="$(awk -v n="$WORKER_COUNT" -v w="$worker_shares" -v v="$vip_shares" 'BEGIN{printf "%.6f", n*w+v}')"
+  total_shares="$(awk -v n="$WORKER_COUNT" -v w="$worker_shares" -v v="$vip_shares" -v vip="$DEPLOY_VIP" \
+    'BEGIN{printf "%.6f", n*w + vip*v}')"
   for ((i = 1; i <= total; i++)); do
     if (( i <= WORKER_COUNT )); then
       MACHINE_NAMES+=("${name_prefix}$((name_start_num + i - 1))")
@@ -692,7 +697,11 @@ deploy() {
   mkdir -p "$IMG_DIR" "$POOL_DIR" "$WORK_DIR" "$CACHE_DIR"
   download_base_image
 
-  log "部署规划: 普通机 ${WORKER_COUNT} 台 + VIP 机 1 台 = 共 ${#MACHINE_NAMES[@]} 台（机器名/IP/MAC/资源均已自动生成）"
+  if [[ "$DEPLOY_VIP" == "1" ]]; then
+    log "部署规划: 普通机 ${WORKER_COUNT} 台 + VIP 机 1 台 = 共 ${#MACHINE_NAMES[@]} 台（机器名/IP/MAC/资源均已自动生成）"
+  else
+    log "部署规划: 普通机 ${WORKER_COUNT} 台（DEPLOY_VIP=0，不部署 VIP 机）= 共 ${#MACHINE_NAMES[@]} 台（机器名/IP/MAC/资源均已自动生成）"
+  fi
 
   # 将 0~1 的 CPU/内存系数换算为实际 vCPU 数和内存 MB
   resolve_vm_specs
@@ -724,15 +733,17 @@ deploy() {
 }
 
 status() {
+  local name state found=0
+  # 与 macOS 侧一致：只列出实际存在的 VM，不存在的机器不输出
   for name in "${ALL_NAMES[@]}"; do
     if virsh dominfo "$name" >/dev/null 2>&1; then
-      local state
       state="$(virsh domstate "$name")"
       printf "%-16s %s\n" "$name" "$state"
-    else
-      printf "%-16s 未部署\n" "$name"
+      found=$((found+1))
     fi
   done
+  [[ "$found" -eq 0 ]] && echo "当前无已部署的 VM"
+  return 0
 }
 
 # 从已生成的 cloud-init user-data 中检测部署时使用的 VM 用户（root/ubuntu）
@@ -928,9 +939,10 @@ load_config() {
 }
 
 # ============ 机器配置自动生成（与 Linux KVM 的 generate_machine_config 对齐） ============
-# 配置文件只指定 WORKER_COUNT / RESOURCE_RATIO / DISK_GB / MACHINE_NAME_START / BASE_SSH_PORT，
+# 配置文件只指定 WORKER_COUNT / DEPLOY_VIP / RESOURCE_RATIO / DISK_GB / MACHINE_NAME_START / BASE_SSH_PORT，
 # 其余全部自动生成:
-#   机器名: 从 MACHINE_NAME_START 起统一编号排列，最后一台为 VIP 机（共 WORKER_COUNT+1 台）
+#   机器名: 从 MACHINE_NAME_START 起统一编号排列，共 WORKER_COUNT 台普通机；
+#           DEPLOY_VIP=1 时末尾追加 1 台 VIP 机（共 WORKER_COUNT+1 台）
 #   CPU/内存: 按 RESOURCE_RATIO（普通机份额:VIP机份额）分摊宿主机资源，系数之和恒为 1
 #   磁盘: 普通机取 DISK_GB，VIP 机按比例反向缩放（VIP 磁盘 = DISK_GB × 普通份额/VIP份额）
 #   SSH 端口: 从 BASE_SSH_PORT（默认 60001）起每台递增 1
@@ -941,8 +953,10 @@ lima_generate_machine_config() {
   DISK_GB="${DISK_GB:-100}"
   MACHINE_NAME_START="${MACHINE_NAME_START:-machine1}"
   BASE_SSH_PORT="${BASE_SSH_PORT:-60001}"
+  DEPLOY_VIP="${DEPLOY_VIP:-1}"
 
   [[ "$WORKER_COUNT" =~ ^[1-9][0-9]*$ ]] || lima_die "WORKER_COUNT='$WORKER_COUNT' 必须为正整数（deploy_vms.env）"
+  [[ "$DEPLOY_VIP" =~ ^[01]$ ]] || lima_die "DEPLOY_VIP='$DEPLOY_VIP' 只能为 0 或 1（1=部署 VIP 机，0=不部署）"
   [[ "$DISK_GB" =~ ^[1-9][0-9]*$ ]] || lima_die "DISK_GB='$DISK_GB' 必须为正整数"
   [[ "$BASE_SSH_PORT" =~ ^[0-9]+$ ]] || lima_die "BASE_SSH_PORT='$BASE_SSH_PORT' 必须为正整数"
 
@@ -973,15 +987,25 @@ lima_generate_machine_config() {
 
   # 宿主机资源总量: CPU 系数换算为整数 vCPU，内存系数换算为整数 GiB
   # （Lima vz 引擎要求 cpus 为整数；小数 GiB 内存换算成 MB 后不是 1MiB 整数倍会被拒绝）
-  local host_cpu host_mem_gb
+  # macOS 需为系统本身保留内存（HOST_MEM_RESERVE_GB，默认 4GiB）：系数按"可用内存"
+  # = 宿主机内存 - 保留值 分摊，避免把整机内存全部分给 VM 导致宿主机内存压力过大、VM 启动极慢
+  HOST_MEM_RESERVE_GB="${HOST_MEM_RESERVE_GB:-4}"
+  [[ "$HOST_MEM_RESERVE_GB" =~ ^[0-9]+$ ]] || lima_die "HOST_MEM_RESERVE_GB='$HOST_MEM_RESERVE_GB' 必须为非负整数（GiB）"
+  local host_cpu host_mem_gb host_mem_total_gb
   host_cpu="$(sysctl -n hw.ncpu)"
-  host_mem_gb="$(awk -v k="$(sysctl -n hw.memsize)" 'BEGIN{printf "%d", k/1024/1024/1024}')"
+  host_mem_total_gb="$(awk -v k="$(sysctl -n hw.memsize)" 'BEGIN{printf "%d", k/1024/1024/1024}')"
+  host_mem_gb="$(awk -v t="$host_mem_total_gb" -v r="$HOST_MEM_RESERVE_GB" \
+    'BEGIN{v=t-r; if(v<1)v=1; print v}')"
+  lima_log "宿主机内存 ${host_mem_total_gb}GiB，为系统保留 ${HOST_MEM_RESERVE_GB}GiB，VM 可分配 ${host_mem_gb}GiB"
+  awk -v t="$host_mem_total_gb" -v r="$HOST_MEM_RESERVE_GB" 'BEGIN{exit !(r>=t)}' \
+    && lima_warn "HOST_MEM_RESERVE_GB=${HOST_MEM_RESERVE_GB} 不小于宿主机内存 ${host_mem_total_gb}GiB，VM 内存将按最少 1GiB 分配"
 
   # CPU/内存按份分配（系数之和恒为 1，正好用满宿主机资源不超分）；
   # 磁盘反向缩放: VIP 磁盘 = DISK_GB × 普通份额/VIP份额
-  local total=$((WORKER_COUNT + 1)) i ratio cpu_v mem_v disk
+  local total=$((WORKER_COUNT + DEPLOY_VIP)) i ratio cpu_v mem_v disk
   local total_shares
-  total_shares="$(awk -v n="$WORKER_COUNT" -v w="$worker_shares" -v v="$vip_shares" 'BEGIN{printf "%.6f", n*w+v}')"
+  total_shares="$(awk -v n="$WORKER_COUNT" -v w="$worker_shares" -v v="$vip_shares" -v vip="$DEPLOY_VIP" \
+    'BEGIN{printf "%.6f", n*w + vip*v}')"
   for ((i = 1; i <= total; i++)); do
     MACHINE_NAMES+=("${name_prefix}$((name_start_num + i - 1))")
     MACHINE_SSH_PORTS+=("$((BASE_SSH_PORT + i - 1))")
@@ -1019,15 +1043,16 @@ usage() {
 deploy_vms.sh (macOS/Lima) — 基于 Lima 批量部署 Linux 虚拟机
 
 用法:
-  ./deploy_vms.sh                          # 交互式选择镜像后部署（默认麒麟 V10）
-  ./deploy_vms.sh deploy kylin-v10         # 使用麒麟 V10 镜像部署
-  ./deploy_vms.sh deploy ubuntu            # 使用 Ubuntu 22.04 镜像部署
+  ./deploy_vms.sh                          # 交互式列出 ../qcow2s/ 下可用原始镜像并选择后部署
+  ./deploy_vms.sh deploy kylin-v10         # 按关键字匹配文件名含 kylin 的镜像部署
+  ./deploy_vms.sh deploy ubuntu            # 按关键字匹配文件名含 ubuntu 的镜像部署
   ./deploy_vms.sh status                   # 查看 VM 状态
   ./deploy_vms.sh ssh-config               # 仅配置本机 SSH 免密别名
   ./deploy_vms.sh destroy                  # 销毁配置中定义的全部 VM（有确认）
 
 子命令:
-  deploy [kylin-v10|ubuntu]   部署全部 VM（不指定镜像时交互式选择，非终端默认 kylin-v10）
+  deploy [kylin-v10|ubuntu]   部署全部 VM（不指定镜像时列出 ../qcow2s/ 下 .qcow2/.img 原始镜像供选择，
+                              多镜像+终端交互选择；非终端取第一个，登录用户按镜像名 ubuntu/kylin 推断）
   status                      查看 VM 状态
   ssh-config                  给本机用户配置 VM 免密 SSH 别名
   destroy                     销毁 deploy_vms.env 中定义的全部 VM
@@ -1112,39 +1137,80 @@ BASE_IMG=""
 IMAGE_SPECIFIED=0
 
 lima_select_image() {
-  # 未通过命令行参数指定镜像时，在终端交互式选择；非终端环境使用默认 kylin-v10
-  if [[ "$IMAGE_SPECIFIED" -ne 1 ]]; then
-    if [[ -t 0 ]]; then
-      echo "请选择部署镜像:"
-      echo "  1) 麒麟 V10 (arm64) [默认]"
-      echo "  2) Ubuntu 22.04 (arm64)"
-      local choice=""
-      read -r -p "请输入 [1/2]（回车默认 1）: " choice </dev/tty || choice=""
-      case "$choice" in
-        2) IMAGE_CHOICE="ubuntu" ;;
-        *) IMAGE_CHOICE="kylin-v10" ;;
-      esac
-    else
-      lima_log "未指定镜像参数且非交互终端，使用默认镜像: kylin-v10"
+  # 扫描镜像目录中的可用原始镜像（.qcow2/.img），部署时选择其一作为 VM 源镜像
+  local -a imgs=()
+  local f idx kw host_arch
+  host_arch="$(uname -m)"
+  shopt -s nullglob
+  for f in "$LIMA_IMG_DIR"/*.qcow2 "$LIMA_IMG_DIR"/*.img; do
+    # 架构过滤：文件名标注 x86_64/amd64 的镜像在 arm64 宿主机上无法启动，直接跳过
+    if [[ "$host_arch" == "arm64" ]] \
+      && [[ "$(printf '%s' "${f##*/}" | tr 'A-Z' 'a-z')" == *x86_64* || "$(printf '%s' "${f##*/}" | tr 'A-Z' 'a-z')" == *amd64* ]]; then
+      lima_warn "跳过非 arm64 镜像: ${f##*/}"
+      continue
     fi
+    imgs+=("$f")
+  done
+  shopt -u nullglob
+
+  if (( ${#imgs[@]} == 0 )); then
+    lima_die "镜像目录无可用原始镜像: ${LIMA_IMG_DIR}（请先放入 .qcow2 云镜像文件）"
   fi
+
+  local selected=""
+  if [[ "$IMAGE_SPECIFIED" -eq 1 ]]; then
+    # 命令行显式指定 ubuntu/kylin-v10 时，按关键字匹配镜像文件名
+    case "$IMAGE_CHOICE" in
+      ubuntu)    kw="ubuntu" ;;
+      kylin-v10) kw="kylin" ;;
+    esac
+    for f in "${imgs[@]}"; do
+      # 文件名大小写不敏感匹配（如 kylin 可匹配 Kylin-Server-...qcow2）
+      if [[ "$(printf '%s' "${f##*/}" | tr 'A-Z' 'a-z')" == *"$kw"* ]]; then selected="$f"; break; fi
+    done
+    [[ -n "$selected" ]] \
+      || lima_die "镜像目录 ${LIMA_IMG_DIR} 中没有文件名含 '$kw' 的镜像（当前可选: ${imgs[*]##*/}）"
+  elif [[ -t 0 ]] && (( ${#imgs[@]} > 1 )); then
+    # 交互终端且有多个镜像：列出让用户选择
+    echo "请选择部署用原始镜像（目录: ${LIMA_IMG_DIR}）:"
+    idx=1
+    for f in "${imgs[@]}"; do
+      echo "  $idx) ${f##*/}"
+      (( idx++ ))
+    done
+    local choice=""
+    read -r -p "请输入序号（回车默认 1）: " choice </dev/tty || choice=""
+    if [[ -z "$choice" ]]; then
+      selected="${imgs[0]}"
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#imgs[@]} )); then
+      selected="${imgs[choice - 1]}"
+    else
+      lima_die "无效序号: $choice"
+    fi
+  else
+    # 仅一个镜像或非交互终端：取排序后的第一个
+    selected="${imgs[0]}"
+    (( ${#imgs[@]} > 1 )) \
+      && lima_log "非交互环境，默认使用第一个镜像: ${selected##*/}（可用 deploy [ubuntu|kylin-v10] 指定）"
+  fi
+
+  BASE_IMG="$selected"
+  IMAGE_CHOICE="${selected##*/}"
+
+  # 登录用户按镜像文件名推断；识别不了时交互询问，非交互环境报错
   case "$IMAGE_CHOICE" in
-    ubuntu|Ubuntu|UBUNTU|1)
-      IMAGE_CHOICE="ubuntu"
-      IMAGE_USER="ubuntu"
-      BASE_IMG="$LIMA_IMG_DIR/ubuntu-22.04-arm64-base.qcow2"
-      lima_log "部署镜像: Ubuntu 22.04 (arm64)"
-      ;;
-    kylin|kylin-v10|Kylin|KYLIN|2)
-      IMAGE_CHOICE="kylin-v10"
-      IMAGE_USER="kylin"
-      BASE_IMG="$LIMA_IMG_DIR/kylin-v10-arm64-base.qcow2"
-      lima_log "部署镜像: 麒麟 V10 (arm64)"
-      ;;
+    *[Uu]buntu*) IMAGE_USER="ubuntu" ;;
+    *[Kk]ylin*)  IMAGE_USER="kylin" ;;
     *)
-      lima_die "未知镜像类型: ${IMAGE_CHOICE}（可选: ubuntu, kylin-v10）"
+      if [[ -t 0 ]]; then
+        read -r -p "无法从镜像名识别默认登录用户，请输入该镜像内置的登录用户名: " IMAGE_USER </dev/tty || IMAGE_USER=""
+        [[ -n "$IMAGE_USER" ]] || lima_die "未输入登录用户名"
+      else
+        lima_die "无法从镜像名识别登录用户（${IMAGE_CHOICE}），请将镜像文件命名为含 ubuntu/kylin 的名字"
+      fi
       ;;
   esac
+  lima_log "部署镜像: ${IMAGE_CHOICE}（登录用户: ${IMAGE_USER}）"
 }
 
 download_file() { # $1=url $2=目标文件
@@ -1252,17 +1318,47 @@ load_image_user() {
 }
 
 # ----------------------------------------------------------------------------
+# 读取 qcow2 镜像虚拟容量（GiB，向上取整）；非 qcow2 或读取失败时输出空
+# Lima 转换镜像时要求目标磁盘不小于镜像虚拟容量，否则 create 会直接失败
+# ----------------------------------------------------------------------------
+qcow2_virtual_size_gib() { # $1=镜像路径
+  local img="$1" magic vsize
+  [[ -f "$img" ]] || return 0
+  magic="$(od -An -j 0 -N 4 -t x1 "$img" 2>/dev/null | tr -d ' \n')"
+  [[ "$magic" == "514649fb" ]] || return 0          # qcow2 魔数 QFI\xfb
+  # 偏移 24 处 8 字节大端整数为虚拟容量（字节）
+  vsize="$(od -An -j 24 -N 8 -t u1 "$img" 2>/dev/null | tr -s ' ' '\n' \
+    | awk 'NF{v=v*256+$1} END{print v+0}')"
+  [[ "$vsize" =~ ^[0-9]+$ ]] && (( vsize > 0 )) || return 0
+  awk -v b="$vsize" 'BEGIN{printf "%d", (b + 1073741823) / 1073741824}'
+}
+
+# ----------------------------------------------------------------------------
 # 创建 VM（幂等：已存在跳过）
 # ----------------------------------------------------------------------------
 create_vms() {
-  local i name cpu mem disk port yaml
+  local i name cpu mem disk port yaml img_min_gib
+  img_min_gib="$(qcow2_virtual_size_gib "$BASE_IMG")"
   for i in "${!MACHINE_NAMES[@]}"; do
     name="${MACHINE_NAMES[$i]}"; cpu="${MACHINE_CPU[$i]}"; mem="${MACHINE_MEM_GBS[$i]}"
     disk="${DISK_GB[$i]}"; port="${MACHINE_SSH_PORTS[$i]}"
 
     if vm_exists "$name"; then
-      lima_log "VM $name 已存在，跳过创建（如需重建: $0 destroy 后重新部署）"
-      continue
+      # 创建中断的实例（无磁盘文件）无法启动，自动清理后重建；已有磁盘的实例照常跳过
+      if [[ ! -f "${HOME}/.lima/${name}/disk" ]]; then
+        lima_warn "检测到不完整的 VM 实例 ${name}（无磁盘，创建中断），自动清理后重建"
+        limactl delete -f "$name" >/dev/null 2>&1 || lima_die "清理不完整实例失败: $name，请手动执行 limactl delete -f $name"
+      else
+        lima_log "VM $name 已存在，跳过创建（如需重建: $0 destroy 后重新部署）"
+        continue
+      fi
+    fi
+
+    # 磁盘不得小于基础镜像虚拟容量（否则 Lima 转换会报 specified size smaller than original image size）
+    if [[ -n "$img_min_gib" ]] && (( disk < img_min_gib )); then
+      lima_warn "磁盘 ${disk}GiB 小于镜像 ${IMAGE_CHOICE} 虚拟容量 ${img_min_gib}GiB，自动上调为 ${img_min_gib}GiB"
+      disk="$img_min_gib"
+      DISK_GB[$i]="$img_min_gib"
     fi
 
     yaml="$(gen_vm_yaml "$name" "$cpu" "$mem" "$disk" "$port")"
@@ -1286,18 +1382,20 @@ port_ready() { # $1=127.0.0.1端口
 
 start_and_wait_vms() {
   local i name port state attempt
+  # limactl start 等待实例就绪的超时（首启较慢的系统镜像可调大，默认 10m）
+  local start_timeout="${LIMA_START_TIMEOUT:-10m}"
   for i in "${!MACHINE_NAMES[@]}"; do
     name="${MACHINE_NAMES[$i]}"; port="${MACHINE_SSH_PORTS[$i]}"
     state="$(vm_state "$name")"
     if [[ "$state" == "Running" ]]; then
       lima_log "VM $name 已在运行，跳过启动"
     else
-      lima_log "启动 VM: ${name}（当前状态: ${state:-未创建}）"
+      lima_log "启动 VM: ${name}（当前状态: ${state:-未创建}，启动超时 ${start_timeout}）"
       if [[ "$DRY_RUN" -eq 1 ]]; then
-        lima_log "[dry-run] 将执行: limactl start --tty=false $name"
+        lima_log "[dry-run] 将执行: limactl start --tty=false --timeout=${start_timeout} $name"
         continue
       fi
-      limactl start --tty=false "$name" || lima_die "启动 VM 失败: $name"
+      limactl start --tty=false --timeout="$start_timeout" "$name" || lima_die "启动 VM 失败: $name"
     fi
 
     if [[ "$DRY_RUN" -eq 0 ]]; then
@@ -1400,6 +1498,8 @@ setup_ssh_user() {
 }
 
 lima_write_machine_md() {
+  # dry-run 仅预览：不覆盖已生成的机器配置信息（避免把真实 IP 覆写为“待获取”）
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
   local i name cpu mem disk port ip
   {
     echo "# 虚拟机配置信息（macOS / Lima）"
@@ -1461,6 +1561,8 @@ lima_write_one_ssh_config() { # $1=home目录 $2=该用户使用的私钥路径
 }
 
 lima_write_ssh_config() {
+  # dry-run 仅预览：不写入本机 ~/.ssh/config
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
   [[ -f "$LIMA_IDENTITY" ]] || lima_warn "Lima 用户密钥尚未生成: ${LIMA_IDENTITY}（首次创建 VM 后自动生成，可稍后重跑 ssh-config）"
 
   lima_write_one_ssh_config "$HOME" "$LIMA_IDENTITY"
@@ -1620,17 +1722,24 @@ do_deploy() {
 do_status() {
   STAGE_TOTAL=1; STAGE_NO=1
   load_config
-  local i name state ip
-  printf "%-16s %-12s %-18s %s\n" "VM" "状态" "IP" "SSH端口"
+  local i name state ip row found=0
+  local -a rows=()
+  # 只列出实际存在的 VM：已销毁/未创建的机器不再输出，保持 status 输出为空
   for i in "${!MACHINE_NAMES[@]}"; do
     name="${MACHINE_NAMES[$i]}"
     state="$(vm_state "$name")"
-    if [[ -z "$state" ]]; then
-      printf "%-16s %-12s %-18s %s\n" "$name" "未部署" "-" "${MACHINE_SSH_PORTS[$i]}"
-    else
-      ip="$(resolve_guest_ip "$name" 2>/dev/null || true)"
-      printf "%-16s %-12s %-18s %s\n" "$name" "$state" "${ip:-未知}" "${MACHINE_SSH_PORTS[$i]}"
-    fi
+    [[ -z "$state" ]] && continue
+    ip="$(resolve_guest_ip "$name" 2>/dev/null || true)"
+    rows+=("$(printf '%-16s %-12s %-18s %s' "$name" "$state" "${ip:-未知}" "${MACHINE_SSH_PORTS[$i]}")")
+    found=$((found+1))
+  done
+  if [[ "$found" -eq 0 ]]; then
+    echo "当前无已部署的 VM"
+    return 0
+  fi
+  printf "%-16s %-12s %-18s %s\n" "VM" "状态" "IP" "SSH端口"
+  for row in "${rows[@]}"; do
+    echo "$row"
   done
 }
 

@@ -83,7 +83,7 @@ if [ -f "$ENV_FILE" ]; then
     # shellcheck disable=SC1090
     source "$ENV_FILE"
 else
-    log_warn "配置文件不存在: $ENV_FILE，使用内置默认值"
+    log_warn "配置文件不存在: ${ENV_FILE}，使用内置默认值"
 fi
 
 BACKUP_DIR="${BACKUP_DIR:-$DEFAULT_BACKUP_DIR}"
@@ -204,7 +204,7 @@ LOG_FILE="$LOG_DIR/backup_vms_$(date '+%Y%m%d_%H%M%S').log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 log_info "=============================================="
-log_info "脚本启动: $SCRIPT_NAME （模式: $MODE）"
+log_info "脚本启动: $SCRIPT_NAME （模式: ${MODE}）"
 log_info "日志文件: $LOG_FILE"
 log_info "运行参数: dry_run=$DRY_RUN clean=$CLEAN_RUN assume_yes=$ASSUME_YES vm_filter=[$CLI_VM_FILTER] restore_set=[$RESTORE_SET_ID]"
 
@@ -221,7 +221,7 @@ check_dep qemu-img
 check_dep awk
 check_dep tee
 if [ "$RETENTION_COUNT" -lt 1 ] 2>/dev/null; then
-    log_error "[1-6] RETENTION_COUNT 配置非法: $RETENTION_COUNT（必须 >= 1）"
+    log_error "[1-6] RETENTION_COUNT 配置非法: ${RETENTION_COUNT}（必须 >= 1）"
     exit 1
 fi
 log_info "[1-6] 依赖与权限检查通过"
@@ -230,7 +230,7 @@ log_info "[1-6] 依赖与权限检查通过"
 # --list 模式: 列出备份集
 #---------------------------------------
 if [ "$MODE" = "list" ]; then
-    log_info "备份集清单（$BACKUP_DIR）:"
+    log_info "备份集清单（${BACKUP_DIR}）:"
     found_any=0
     for d in "$BACKUP_DIR"/set_*; do
         [ -d "$d" ] || continue
@@ -283,7 +283,7 @@ if [ "$MODE" = "restore" ]; then
     done
     RESTORE_VMS="${RESTORE_VMS# }"
     if [ -z "$RESTORE_VMS" ]; then
-        log_error "[2-6] 备份集中没有匹配的虚机可恢复（备份集: $SET_ID，过滤: [$CLI_VM_FILTER]）"
+        log_error "[2-6] 备份集中没有匹配的虚机可恢复（备份集: ${SET_ID}，过滤: [$CLI_VM_FILTER]）"
         exit 1
     fi
 
@@ -511,7 +511,7 @@ SET_ID=""
 last_set=$(cat "$STATE_DIR/latest_set" 2>/dev/null || true)
 if [ -n "$last_set" ] && [ -d "$BACKUP_DIR/$last_set" ] && [ ! -f "$BACKUP_DIR/$last_set/.complete" ]; then
     SET_ID="$last_set"
-    log_warn "[3-6] 发现未完成的备份集 $SET_ID，本次将续跑（已完成虚机自动跳过）"
+    log_warn "[3-6] 发现未完成的备份集 ${SET_ID}，本次将续跑（已完成虚机自动跳过）"
 fi
 if [ -z "$SET_ID" ]; then
     SET_ID="set_$(date '+%Y%m%d_%H%M%S')"
@@ -540,7 +540,7 @@ log_info "[3-6] 空间检查通过: 预估需要 ${ESTIMATE_MB}MB，可用 ${AVA
 #---------------------------------------
 # 阶段4-6: 逐虚机备份（打印进度、幂等续跑）
 #---------------------------------------
-log_info "[4-6] 开始逐虚机备份（备份集: $SET_ID）"
+log_info "[4-6] 开始逐虚机备份（备份集: ${SET_ID}）"
 if [ "$DRY_RUN" -eq 0 ]; then
     mkdir -p "$SET_DIR"
     echo "$SET_ID" > "$STATE_DIR/latest_set"
@@ -665,7 +665,7 @@ elif [ "$DRY_RUN" -eq 1 ]; then
 else
     old_sets=$(ls -1d "$BACKUP_DIR"/set_* 2>/dev/null | sort | head -n -"$RETENTION_COUNT")
     if [ -n "$old_sets" ]; then
-        log_warn "[6-6] 以下旧备份集超出保留数量 $RETENTION_COUNT，将被删除:"
+        log_warn "[6-6] 以下旧备份集超出保留数量 ${RETENTION_COUNT}，将被删除:"
         echo "$old_sets" | while read -r s; do log_warn "    - $s"; done
         if confirm "[6-6] 确认删除以上旧备份集?"; then
             echo "$old_sets" | while read -r s; do

@@ -10,7 +10,7 @@
 
 - 一键批量部署多台 VM（Linux 按 `WORKER_COUNT` 自动生成机器名/IP/MAC/规格；macOS 按数组逐台配置）
 - CPU/内存按 `RESOURCE_RATIO`（默认 2:1）分摊：资源共 `台数*普通份额+VIP份额` 份，系数之和恒为 1，正好用满不超分；磁盘/swap 也按此比例缩放
-- 自动追加 1 台 VIP 机，机器名统一按 `machine1`、`machine2`… 编号（VIP 机为最后一台），资源按比例小于普通机
+- 自动追加 1 台 VIP 机（`DEPLOY_VIP=1` 默认开启，设 `DEPLOY_VIP=0` 可关闭），机器名统一按 `machine1`、`machine2`… 编号（VIP 机为最后一台），资源按比例小于普通机
 - cloud-init 自动初始化：主机名、时区、用户、SSH 公钥、静态 IP
 - libvirt default 网络静态 IP 绑定（DHCP host 按 MAC 固定分配）
 - 自动配置宿主机与 VM 的 SSH 免密（RSA 密钥），所有本地普通用户均可通过 `machine1` 等别名直连
@@ -58,8 +58,11 @@ vm_deploy/
 配置文件只需指定普通机台数，机器名/MAC/IP/CPU/内存/磁盘/swap 全部自动生成：
 
 ```bash
-# 普通 VM 台数（正整数）。实际部署台数 = 台数 + 1（额外 1 台 VIP 机）
-# 例：填 3 实际部署 4 台（3 普通 + 1 VIP）
+# 是否部署 VIP 机（1=部署，0=不部署）
+DEPLOY_VIP=1
+
+# 普通 VM 台数（正整数）。DEPLOY_VIP=1 时实际部署台数 = 台数 + 1（额外 1 台 VIP 机）
+# 例：填 3 实际部署 4 台（3 普通 + 1 VIP）；DEPLOY_VIP=0 时填 3 只部署 3 台
 WORKER_COUNT=2
 ```
 
@@ -73,13 +76,13 @@ IP_START="192.168.122.10" # 自动分配 IP 的起始地址，往后顺序递增
 MACHINE_NAME_START="machine1" # 起始机器名（前缀可自定义，如 node5 → node5、node6...）
 ```
 
-CPU/内存按 `RESOURCE_RATIO` 按份自动分配（支持小数份额）：资源共分成 `台数*普通份额+VIP份额` 份。例：填 3 台 + 比例 2:1 → 4 台分 7 份，普通机各占 2/7、VIP 机占 1/7，系数之和恰为 1，正好用满宿主机资源不超分。磁盘/swap 也按此比例缩放（VIP 机 = 普通机 × VIP份额/普通份额）。
+CPU/内存按 `RESOURCE_RATIO` 按份自动分配（支持小数份额）：资源共分成 `台数*普通份额+VIP份额` 份（`DEPLOY_VIP=0` 时为 `台数*普通份额` 份，普通机均分）。例：填 3 台 + 比例 2:1 → 4 台分 7 份，普通机各占 2/7、VIP 机占 1/7，系数之和恰为 1，正好用满宿主机资源不超分。磁盘/swap 也按此比例缩放（VIP 机 = 普通机 × VIP份额/普通份额）。
 
 自动生成规则：
 
 | 项目 | 规则 |
 |------|------|
-| 机器名 | 从 `MACHINE_NAME_START`（默认 `machine1`，前缀可自定义）起统一编号排列，最后一台为 VIP 机 |
+| 机器名 | 从 `MACHINE_NAME_START`（默认 `machine1`，前缀可自定义）起统一编号排列，`DEPLOY_VIP=1` 时最后一台为 VIP 机 |
 | CPU/内存 | 按 `RESOURCE_RATIO` 按份分摊（系数之和恒为 1） |
 | 静态 IP | 从 `IP_START`（默认 `192.168.122.10`）起顺序递增 |
 | MAC | 随机生成（`52:54:00` 前缀，自动去重）；重复部署从清单文件复用旧 MAC |
@@ -166,7 +169,7 @@ macOS 上执行 `./deploy_vms.sh` 会自动走内置的 Lima 实现（与 KVM �
 
 | 项目 | Linux (KVM) | macOS (Lima) |
 |------|-------------|--------------|
-| 配置模型 | `WORKER_COUNT` + `RESOURCE_RATIO` + `DISK_GB` 自动生成机器名/规格（共 `WORKER_COUNT+1` 台，末台 VIP） | 与 Linux 完全一致（共用同一批配置项）；macOS 段额外配置 `BASE_SSH_PORT`（首台 SSH 端口，逐台递增）、`VM_TYPE`、镜像路径等 |
+| 配置模型 | `WORKER_COUNT` + `DEPLOY_VIP` + `RESOURCE_RATIO` + `DISK_GB` 自动生成机器名/规格（共 `WORKER_COUNT+1` 台，末台 VIP；`DEPLOY_VIP=0` 时共 `WORKER_COUNT` 台） | 与 Linux 完全一致（共用同一批配置项）；macOS 段额外配置 `BASE_SSH_PORT`（首台 SSH 端口，逐台递增）、`VM_TYPE`、镜像路径等 |
 | 网络 | libvirt NAT 静态 IP（DHCP host 按 MAC 绑定） | Lima NAT，宿主机走 `127.0.0.1:<固定SSH端口>` 转发；VM 互解析写入 VM 内 `/etc/hosts` |
 | 登录方式 | `ssh -i <私钥> user@<IP>` / `ssh machine1` 别名 | `ssh machine1` 别名（固定端口，VM 重启后依然有效）；控制台 `limactl shell machine1` |
 | 默认用户 | 麒麟 root / Ubuntu 可配 | `SSH_USER`（默认 root，脚本自动写入 Lima 密钥并放开密钥登录） |
